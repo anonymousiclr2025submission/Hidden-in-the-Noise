@@ -24,6 +24,7 @@ import torch.nn.functional as F
 import time
 from collections import Counter
 import random
+from torchvision import transforms
 
 def parse_args():
     parser = argparse.ArgumentParser(description='multiple-key identification with noise matching')
@@ -451,16 +452,19 @@ class WatermarkClass:
 
         min_distance = float('inf')
         detected_m = -1
+        rotation_angles = [0,74,76] # The method is robust to any degree of rotation by checking rotation patterns like 2n or 4n+1.
 
         first_stage_start = time.time()
         # Search among the group with the same ring (key)
         for (n, m), watermarked_latent in self.watermarked_latents.items():
             if n == detected_n:
                 watermarked_latent = watermarked_latent.to(self.device)
-                distance = torch.norm(reversed_latent - watermarked_latent)
-                if distance < min_distance:
-                    min_distance = distance
-                    detected_m = m
+                for angle in rotation_angles:
+                    watermarked_latent = transforms.RandomRotation((angle, angle))(watermarked_latent)
+                    distance = torch.norm(reversed_latent - watermarked_latent)
+                    if distance < min_distance:
+                        min_distance = distance
+                        detected_m = m
         first_stage_time = time.time() - first_stage_start
 
         self.total_detections += 1
@@ -480,11 +484,11 @@ class WatermarkClass:
             self.total_second_stage_time += second_stage_time
 
         true_distance = min_distance
+        total_time = time.time() - start_time
 
         # Random distances based on L2 norms
         random_distances = [torch.norm(reversed_latent - torch.randn_like(reversed_latent)).item() for _ in range(100)]
 
-        total_time = time.time() - start_time
 
         wandb.log({
             "detection_total_time": total_time,
