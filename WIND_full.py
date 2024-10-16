@@ -12,7 +12,7 @@ import wandb
 from inverse_stable_diffusion import InversableStableDiffusionPipeline
 from diffusers import DPMSolverMultistepScheduler
 import open_clip
-import hashlib  
+import hashlib
 import itertools
 from copy import deepcopy
 from scipy.ndimage import rotate
@@ -111,8 +111,8 @@ def main(args):
 
     if args.reference_model is not None:
         ref_model, _, ref_clip_preprocess = open_clip.create_model_and_transforms(
-            args.reference_model, 
-            pretrained=reference_model_pretrain, 
+            args.reference_model,
+            pretrained=reference_model_pretrain,
             device=device
             )
         ref_tokenizer = open_clip.get_tokenizer(args.reference_model)
@@ -127,16 +127,16 @@ def main(args):
     original_latents_shape = base_latents.shape
     sing_channel_ring_watermark_mask = torch.tensor(
             ring_mask(
-                size = original_latents_shape[-1], 
-                r_out = RADIUS, 
+                size = original_latents_shape[-1],
+                r_out = RADIUS,
                 r_in = RADIUS_CUTOFF)
             )
     
     if len(HETER_WATERMARK_CHANNEL) > 0:
         single_channel_heter_watermark_mask = torch.tensor(
                 ring_mask(
-                    size = original_latents_shape[-1], 
-                    r_out = RADIUS, 
+                    size = original_latents_shape[-1],
+                    r_out = RADIUS,
                     r_in = RADIUS_CUTOFF)
                 )
         heter_watermark_region_mask = single_channel_heter_watermark_mask.unsqueeze(0).repeat(len(HETER_WATERMARK_CHANNEL), 1, 1).to(device)
@@ -158,12 +158,12 @@ def main(args):
         key_value_combinations = random.sample(key_value_combinations, k=args.assigned_keys)
 
     
-    Fourier_watermark_pattern_list = [make_Fourier_ringid_pattern(device, list(combo), base_latents, 
+    Fourier_watermark_pattern_list = [make_Fourier_ringid_pattern(device, list(combo), base_latents,
                                                                                     radius=RADIUS, radius_cutoff=RADIUS_CUTOFF,
-                                                                                    ring_watermark_channel=RING_WATERMARK_CHANNEL, 
+                                                                                    ring_watermark_channel=RING_WATERMARK_CHANNEL,
                                                                                     heter_watermark_channel=HETER_WATERMARK_CHANNEL,
                                                                                     heter_watermark_region_mask=heter_watermark_region_mask if len(HETER_WATERMARK_CHANNEL)>0 else None)
-                                                                                    for _, combo in enumerate(key_value_combinations)]            
+                                                                                    for _, combo in enumerate(key_value_combinations)]
 
     ring_capacity = len(Fourier_watermark_pattern_list)
 
@@ -362,13 +362,29 @@ class WatermarkClass:
         self.N = N
         self.Fourier_watermark_pattern_list = Fourier_watermark_pattern_list
         self.watermark_region_mask = watermark_region_mask
-        self.watermarked_latents = {}
         self.salt = "ekofijorfgjirejoiconime"
         self.text_embeddings = pipe.get_text_embedding('')
         self.second_stage_count = 0
         self.total_detections = 0
         self.total_second_stage_time = 0
 
+        # Initialize M noises and pre-compute Fourier watermarked latents
+        torch.manual_seed(args.general_seed)
+        self.noises = torch.randn(M, 4, 64, 64, device=self.device, dtype=torch.float16)
+        self.pre_computed_latents = [[] for _ in range(N)]
+        
+        for m in range(M):
+            _, n = self._generate_hash(m)
+            Fourier_watermark_latents = generate_Fourier_watermark_latents(
+                device=self.device,
+                radius=RADIUS,
+                radius_cutoff=RADIUS_CUTOFF,
+                original_latents=self.noises[m].unsqueeze(0),
+                watermark_pattern=self.Fourier_watermark_pattern_list[n],
+                watermark_channel=WATERMARK_CHANNEL,
+                watermark_region_mask=self.watermark_region_mask,
+            )
+            self.pre_computed_latents[n].append((m, Fourier_watermark_latents))
 
     def _generate_hash(self, m):
         n = m % self.N
@@ -377,37 +393,18 @@ class WatermarkClass:
         hash_output = int.from_bytes(hash_object.digest(), byteorder='big') % (2**32 - 1)
         return hash_output, n
 
-
     def encode_and_generate(self, pipe, prompt, iteration):
-        m = random.randint(1, self.M)
-        hash_value, n = self._generate_hash(m)
+        m = random.randint(0, self.M - 1)  # Select a random noise index
+        _, n = self._generate_hash(m)
         
-        # Use hash as seed to generate noise
-        torch.manual_seed(hash_value)
-        torch.cuda.manual_seed_all(hash_value)
-        noise = torch.randn(4, 64, 64, device=self.device, dtype=torch.float16)
-        
-        # Add the n-th key/ring pattern to the noise
-        Fourier_watermark_latents = generate_Fourier_watermark_latents(
-            device=self.device,
-            radius=RADIUS,
-            radius_cutoff=RADIUS_CUTOFF,
-            original_latents=noise.unsqueeze(0),
-            watermark_pattern=self.Fourier_watermark_pattern_list[n],
-            watermark_channel=WATERMARK_CHANNEL,
-            watermark_region_mask=self.watermark_region_mask,
-        )
-        
-        encoded_noise = Fourier_watermark_latents.to(dtype=pipe.unet.dtype, device=pipe.device)
-        
-        self.watermarked_latents[(n, m)] = encoded_noise.cpu()
+        # Use pre-computed Fourier watermarked latents
+        encoded_noise = next(latent for idx, latent in self.pre_computed_latents[n] if idx == m)
+        encoded_noise = encoded_noise.to(dtype=pipe.unet.dtype, device=pipe.device)
         
         with torch.no_grad():
             image = pipe(prompt, latents=encoded_noise, num_inference_steps=self.args.num_inference_steps).images[0]
         return image, n, m, encoded_noise
 
-
-        
     def detect_watermark_stage1(self, pipe, image):
         # Extract latent representation
         image_tensor = transform_img(image).unsqueeze(0).to(device=self.device, dtype=pipe.vae.dtype)
@@ -430,8 +427,8 @@ class WatermarkClass:
             key_pattern = self.Fourier_watermark_pattern_list[n]
             
             distance = get_distance(
-                key_pattern, 
-                reversed_latent_fft, 
+                key_pattern,
+                reversed_latent_fft,
                 self.watermark_region_mask,
                 p=2,  # Using L2 norm
                 mode='complex',
@@ -444,7 +441,22 @@ class WatermarkClass:
                 detected_n = n
 
         return detected_n, reversed_latent
-    
+
+    def sliding_window_detection(self, reversed_latent, watermarked_latent, window_size=32, stride=8):
+        reversed_latent = reversed_latent.squeeze(0)  # Remove batch dimension if present
+        watermarked_latent = watermarked_latent.squeeze(0)
+        
+        c, h, w = reversed_latent.shape
+        best_similarity = float('-inf')
+        
+        for i in range(0, h - window_size + 1, stride):
+            for j in range(0, w - window_size + 1, stride):
+                window = reversed_latent[:, i:i+window_size, j:j+window_size]
+                similarity = F.cosine_similarity(window.flatten(), watermarked_latent[:, i:i+window_size, j:j+window_size].flatten(), dim=0)
+                if similarity > best_similarity:
+                    best_similarity = similarity
+        
+        return best_similarity.item()
 
     def detect_and_evaluate(self, pipe, image):
         start_time = time.time()
@@ -452,43 +464,47 @@ class WatermarkClass:
 
         min_distance = float('inf')
         detected_m = -1
-        rotation_angles = [0,74,76] # The method is robust to any degree of rotation by checking rotation patterns like 2n or 4n+1.
+        rotation_angles = [0,74.5,75.5]
 
         first_stage_start = time.time()
-        # Search among the group with the same ring (key)
-        for (n, m), watermarked_latent in self.watermarked_latents.items():
-            if n == detected_n:
-                watermarked_latent = watermarked_latent.to(self.device)
-                for angle in rotation_angles:
-                    watermarked_latent = transforms.RandomRotation((angle, angle))(watermarked_latent)
-                    distance = torch.norm(reversed_latent - watermarked_latent)
-                    if distance < min_distance:
-                        min_distance = distance
-                        detected_m = m
-        first_stage_time = time.time() - first_stage_start
-
-        self.total_detections += 1
-
-        second_stage_time = 0
-        if detected_m == -1:
-            self.second_stage_count += 1
-            second_stage_start = time.time()
-            for (n, m), watermarked_latent in self.watermarked_latents.items():
-                watermarked_latent = watermarked_latent.to(self.device)
-                distance = torch.norm(reversed_latent - watermarked_latent)
+        # Search among all M/N latents in the detected ring group
+        for m, watermarked_latent in self.pre_computed_latents[detected_n]:
+            watermarked_latent = watermarked_latent.to(self.device)
+            for angle in rotation_angles:
+                rotated_latent = transforms.RandomRotation((angle, angle))(watermarked_latent)
+                distance = torch.norm(reversed_latent - rotated_latent)
                 if distance < min_distance:
                     min_distance = distance
-                    detected_n = n
                     detected_m = m
+        first_stage_time = time.time() - first_stage_start
+        
+        self.total_detections += 1
+        second_stage_detected_m = -1
+        second_stage_time = 0
+        second_stage_min_distance = float('inf')
+
+
+        if min_distance > 160 or detected_m == -1:
+            print('Second stage')
+            self.second_stage_count += 1
+            second_stage_start = time.time()
+            for n in range(self.N):
+                for m, watermarked_latent in self.pre_computed_latents[n]:
+                    watermarked_latent = watermarked_latent.to(self.device)
+                    similarity = self.sliding_window_detection(reversed_latent, watermarked_latent)
+                    distance = 1 - similarity
+                    if distance < second_stage_min_distance:
+                        second_stage_min_distance = distance
+                        detected_n = n
+                        detected_m = m
             second_stage_time = time.time() - second_stage_start
             self.total_second_stage_time += second_stage_time
-
+        
         true_distance = min_distance
         total_time = time.time() - start_time
 
         # Random distances based on L2 norms
         random_distances = [torch.norm(reversed_latent - torch.randn_like(reversed_latent)).item() for _ in range(100)]
-
 
         wandb.log({
             "detection_total_time": total_time,
@@ -500,7 +516,6 @@ class WatermarkClass:
 
 
 
-
 if __name__ == '__main__':
     args = parse_args()
     try:
@@ -508,3 +523,4 @@ if __name__ == '__main__':
     except Exception as e:
         wandb.finish(exit_code=1)
         raise e
+
